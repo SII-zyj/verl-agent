@@ -599,6 +599,65 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
+
+class MedicalEnvironmentManager(EnvironmentManagerBase):
+    def __init__(self, envs, projection_f, config):
+        self.memory = SimpleMemory()
+        super().__init__(envs, projection_f, config)
+
+    def reset(self, kwargs):
+        text_obs, infos = self.envs.reset()
+        self.memory.reset(batch_size=len(text_obs))
+        self.pre_text_obs = text_obs
+
+        full_text_obs = self.build_text_obs(text_obs, infos, init=True)
+        return {'text': full_text_obs, 'image': None, 'anchor': text_obs}, infos
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+        text_obs, rewards, dones, infos = self.envs.step(actions)
+        self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
+        self.pre_text_obs = text_obs
+
+        full_text_obs = self.build_text_obs(text_obs, infos)
+        for i, info in enumerate(infos):
+            info['is_action_valid'] = to_numpy(valids[i])
+
+        next_observations = {'text': full_text_obs, 'image': None, 'anchor': text_obs}
+        rewards = to_numpy(rewards)
+        dones = to_numpy(dones)
+
+        return next_observations, rewards, dones, infos
+
+    def build_text_obs(self, text_obs: List[str], infos: List[Dict], init: bool = False) -> List[str]:
+        postprocess_text_obs = []
+        if not init and self.config.env.history_length > 0:
+            memory_contexts, valid_lens = self.memory.fetch(
+                    self.config.env.history_length,
+                    obs_key="text_obs",
+                    action_key="action")
+
+        for i in range(len(text_obs)):
+            available_tools = infos[i].get('available_tools', []) if i < len(infos) else []
+            tool_block = "\n".join(f"- {tool}" for tool in available_tools)
+
+            if init or self.config.env.history_length <= 0:
+                obs = MEDICAL_AGENT_TEMPLATE_NO_HIS.format(
+                        patient_overview=text_obs[i],
+                        available_tools=tool_block,
+                    )
+            else:
+                obs = MEDICAL_AGENT_TEMPLATE.format(
+                        patient_overview=text_obs[i],
+                        step_count=len(self.memory[i]),
+                        history_length=valid_lens[i],
+                        action_history=memory_contexts[i],
+                        current_step=len(self.memory[i]) + 1,
+                        available_tools=tool_block,
+                    )
+            postprocess_text_obs.append(obs)
+        return postprocess_text_obs
+
 def make_envs(config):
     """
     Create enviroments 
@@ -689,10 +748,23 @@ def make_envs(config):
         from agent_system.environments.env_package.appworld import build_appworld_envs, appworld_projection
         _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0, resources_per_worker=resources_per_worker)
         _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n, resources_per_worker=resources_per_worker)
-        
+
         projection_f = partial(appworld_projection)
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
+        return envs, val_envs
+    elif "medical_agent" in config.env.env_name.lower():
+        from agent_system.environments.env_package.medical_agent import build_medical_agent_envs, medical_agent_projection
+        env_kwargs = {}
+        if hasattr(config.env, 'medical_agent'):
+            env_kwargs = OmegaConf.to_container(config.env.medical_agent, resolve=True)
+
+        _envs = build_medical_agent_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
+        _val_envs = build_medical_agent_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
+
+        projection_f = partial(medical_agent_projection)
+        envs = MedicalEnvironmentManager(_envs, projection_f, config)
+        val_envs = MedicalEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     else:
         print("Environment not supported")
