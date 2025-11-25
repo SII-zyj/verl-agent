@@ -13,27 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import numpy as np
 import gym
+import numpy as np
 import ray
+import re
+
+
+DEFAULT_TOOLS = ["Zoom-in", "BiomedParse", "SAM2"]
 
 
 def _default_cases():
     return [
         {
-            "description": "Patient reports fever, cough, and shortness of breath after recent travel.",
-            "diagnosis": "pneumonia",
-            "tools": ["zoom-in", "lab_orders", "vitals_monitor"],
-        },
-        {
-            "description": "Patient complains of severe headache with photophobia and neck stiffness.",
-            "diagnosis": "meningitis",
-            "tools": ["sam2", "lumbar_puncture", "ct_head"],
-        },
-        {
-            "description": "Patient presents with chest pain radiating to left arm, diaphoresis, and nausea.",
-            "diagnosis": "myocardial infarction",
-            "tools": ["ecg", "troponin", "biomedparse"],
+            "question": "Based on this CT image, is there an abnormality?",
+            "question_type": "multiple choice",
+            "options": [
+                "(A) pancreas tumor",
+                "(B) No abnormality detected",
+                "(C) liver tumor",
+                "(D) kidney tumor",
+                "(E) kidney cyst",
+            ],
+            "answer": "C",
+            "data_type": "vqa",
+            "source": "biomedparse",
         },
     ]
 
@@ -47,40 +50,88 @@ class MedicalAgentWorker:
         self._cases = list(self.env_kwargs.get("cases", _default_cases()))
         if len(self._cases) == 0:
             self._cases = _default_cases()
-        self.max_steps = int(self.env_kwargs.get("max_steps", 4))
 
-        self._current_case = None
+        self._current_case: dict | None = None
         self._step_count = 0
+        self._data_type = "vqa"
+        self.max_steps = int(self.env_kwargs.get("max_steps", 4))
 
     def _sample_case(self):
         idx = self._rng.randint(0, len(self._cases))
-        self._current_case = self._cases[idx]
-        self._step_count = 0
+        return self._cases[idx]
 
-    def reset(self):
-        self._sample_case()
-        obs = self._current_case["description"]
+    def _format_overview(self, case: dict) -> str:
+        question = case.get("question", "")
+        options = case.get("options") or []
+        if isinstance(options, (list, tuple)) and len(options) > 0:
+            options_block = "\n" + "\n".join(str(opt) for opt in options)
+        else:
+            options_block = ""
+        question_type = case.get("question_type")
+        if question_type:
+            prefix = f"[{question_type}] "
+        else:
+            prefix = ""
+        return f"{prefix}{question}{options_block}"
+
+    def _prepare_case(self, env_kwargs: dict | None) -> dict:
+        if env_kwargs:
+            return env_kwargs
+        return self._sample_case()
+
+    def reset(self, env_kwargs: dict | None = None):
+        case = self._prepare_case(env_kwargs)
+        self._current_case = case
+        self._step_count = 0
+        self._data_type = (case.get("data_type") or "vqa").lower()
+        self.max_steps = int(case.get("max_steps", self.max_steps))
+
+        obs = self._format_overview(case)
         info = {
-            "available_tools": list(self._current_case.get("tools", [])),
-            "ground_truth": self._current_case.get("diagnosis", ""),
+            "available_tools": list(case.get("available_tools", DEFAULT_TOOLS)),
+            "ground_truth": case.get("answer", ""),
+            "data_type": case.get("data_type"),
+            "question_id": case.get("question_id"),
+            "question_type": case.get("question_type"),
+            "source": case.get("source"),
+            "image_path": case.get("image_path"),
+            "mask_path": case.get("mask_path"),
             "won": False,
             "step_count": self._step_count,
         }
         return obs, info
 
+    def _extract_answer(self, action: str) -> str | None:
+        for pattern in [r"<answer>\s*([A-Za-z])\b", r"answer\s*[:：]\s*([A-Za-z])"]:
+            match = re.search(pattern, action, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                return match.group(1).strip().upper()
+        # fallback: try to find standalone option letter
+        letter_match = re.search(r"\b([A-E])\b", action, flags=re.IGNORECASE)
+        if letter_match:
+            return letter_match.group(1).upper()
+        return None
+
     def step(self, action: str):
         self._step_count += 1
-        action_l = action.lower()
-        target = self._current_case.get("diagnosis", "").lower()
+        obs = self._format_overview(self._current_case)
 
-        won = bool(target and target in action_l)
-        reward = 10.0 if won else 0.0
+        predicted_answer = self._extract_answer(action) or ""
+        target_answer = (self._current_case.get("answer") or "").upper()
+
+        won = bool(predicted_answer and target_answer and predicted_answer == target_answer)
+        reward = 1.0 if won else 0.0
         done = bool(won or self._step_count >= self.max_steps)
 
-        obs = self._current_case["description"]
         info = {
-            "available_tools": list(self._current_case.get("tools", [])),
-            "ground_truth": self._current_case.get("diagnosis", ""),
+            "available_tools": list(self._current_case.get("available_tools", DEFAULT_TOOLS)),
+            "ground_truth": target_answer,
+            "data_type": self._data_type,
+            "question_id": self._current_case.get("question_id"),
+            "question_type": self._current_case.get("question_type"),
+            "source": self._current_case.get("source"),
+            "image_path": self._current_case.get("image_path"),
+            "mask_path": self._current_case.get("mask_path"),
             "won": won,
             "step_count": self._step_count,
         }
@@ -116,18 +167,25 @@ class MedicalAgentEnvs(gym.Env):
             self._workers.append(worker)
 
     def step(self, actions: list[str]):
-        if len(actions) != self.num_processes:
+        if len(actions) > self.num_processes:
             raise ValueError(
-                f"Expected {self.num_processes} actions, got {len(actions)}",
+                f"Expected at most {self.num_processes} actions, got {len(actions)}",
             )
 
+        pad_n = self.num_processes - len(actions)
+        padded_actions = list(actions) + [""] * pad_n
+        valid_mask = [True] * len(actions) + [False] * pad_n
+
         futures = []
-        for worker, action in zip(self._workers, actions):
+        for worker, action in zip(self._workers, padded_actions):
             futures.append(worker.step.remote(action))
         results = ray.get(futures)
 
         obs_list, reward_list, done_list, info_list = [], [], [], []
-        for obs, reward, done, info in results:
+        for keep, result in zip(valid_mask, results):
+            if not keep:
+                continue
+            obs, reward, done, info = result
             obs_list.append(obs)
             reward_list.append(reward)
             done_list.append(done)
@@ -135,14 +193,27 @@ class MedicalAgentEnvs(gym.Env):
 
         return obs_list, reward_list, done_list, info_list
 
-    def reset(self):
+    def reset(self, kwargs: list[dict] | None = None):
+        kwargs = kwargs or []
+        if len(kwargs) > self.num_processes:
+            raise ValueError(
+                f"Expected at most {self.num_processes} env kwargs, got {len(kwargs)}",
+            )
+
+        pad_n = self.num_processes - len(kwargs)
+        padded_kwargs = list(kwargs) + [{}] * pad_n
+        valid_mask = [True] * len(kwargs) + [False] * pad_n
+
         futures = []
-        for worker in self._workers:
-            futures.append(worker.reset.remote())
+        for worker, env_kwargs in zip(self._workers, padded_kwargs):
+            futures.append(worker.reset.remote(env_kwargs))
         results = ray.get(futures)
 
         obs_list, info_list = [], []
-        for obs, info in results:
+        for keep, result in zip(valid_mask, results):
+            if not keep:
+                continue
+            obs, info = result
             obs_list.append(obs)
             info_list.append(info)
         return obs_list, info_list

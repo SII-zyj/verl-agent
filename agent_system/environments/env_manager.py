@@ -606,7 +606,7 @@ class MedicalEnvironmentManager(EnvironmentManagerBase):
         super().__init__(envs, projection_f, config)
 
     def reset(self, kwargs):
-        text_obs, infos = self.envs.reset()
+        text_obs, infos = self.envs.reset(kwargs=kwargs)
         self.memory.reset(batch_size=len(text_obs))
         self.pre_text_obs = text_obs
 

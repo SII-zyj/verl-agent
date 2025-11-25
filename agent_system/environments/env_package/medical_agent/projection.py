@@ -17,36 +17,45 @@ from typing import List
 import re
 
 
+def _extract_tool_or_answer(text: str) -> str:
+    answer_match = re.search(r"<answer>(.*?)</answer>", text, flags=re.IGNORECASE | re.DOTALL)
+    if answer_match:
+        return answer_match.group(1).strip()
+
+    tool_match = re.search(r"<tool_call>(.*?)</tool_call>", text, flags=re.IGNORECASE | re.DOTALL)
+    if tool_match:
+        return tool_match.group(1).strip()
+
+    action_match = re.search(r"action\s*[:：]\s*([A-Za-z0-9_\- ]+)", text, flags=re.IGNORECASE)
+    if action_match:
+        return action_match.group(1).strip()
+
+    tag_match = re.search(r"<action>(.*?)</action>", text, flags=re.IGNORECASE | re.DOTALL)
+    if tag_match:
+        return tag_match.group(1).strip()
+
+    return text[-50:]
+
+
 def medical_agent_projection(actions: List[str]):
     """Process LLM outputs to extract structured actions for the environment."""
 
     valids = [0] * len(actions)
+    processed_actions: List[str] = [""] * len(actions)
 
-    for i in range(len(actions)):
-        original_str = actions[i]
-        actions[i] = actions[i].lower()
+    for i, action in enumerate(actions):
+        original_str = action or ""
+        action_lower = original_str.lower()
 
-        start_tag = "<action>"
-        end_tag = "</action>"
-        start_idx = actions[i].find(start_tag)
-        end_idx = actions[i].find(end_tag)
-        try:
-            if start_idx == -1 or end_idx == -1:
-                actions[i] = actions[i][-50:]
-                continue
+        extracted_action = _extract_tool_or_answer(original_str)
+        processed_actions[i] = extracted_action
 
-            extracted_action = actions[i][start_idx + len(start_tag):end_idx].strip().lower()
-            actions[i] = extracted_action
+        think_start_idx = action_lower.find("<think>")
+        think_end_idx = action_lower.find("</think>")
+        if think_start_idx != -1 and think_end_idx != -1:
             valids[i] = 1
-        except Exception:
-            actions[i] = actions[i][-50:]
 
-        think_start_idx = original_str.find("<think>")
-        think_end_idx = original_str.find("</think>")
-        if think_start_idx == -1 or think_end_idx == -1:
+        if re.search(r"[\u4e00-\u9fff]", original_str):
             valids[i] = 0
 
-        if re.search(r'[\u4e00-\u9fff]', original_str):
-            valids[i] = 0
-
-    return actions, valids
+    return processed_actions, valids
