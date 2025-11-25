@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .alfworld import *
-from .webshop import *
-from .sokoban import *
-from .gym_cards import *
-from .appworld import *
-from .search import *
-from .medical_agent import *
+from .envs import build_medical_agent_envs
+from .projection import medical_agent_projection
+
+__all__ = [
+    "build_medical_agent_envs",
+    "medical_agent_projection",
+]
