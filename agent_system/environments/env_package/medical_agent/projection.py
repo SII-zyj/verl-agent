@@ -48,7 +48,8 @@ def medical_agent_projection(actions: List[str]):
         action_lower = original_str.lower()
 
         extracted_action = _extract_tool_or_answer(original_str)
-        processed_actions[i] = extracted_action
+        cleaned_action = original_str.strip()
+        processed_actions[i] = cleaned_action if cleaned_action else extracted_action
 
         think_start_idx = action_lower.find("<think>")
         think_end_idx = action_lower.find("</think>")

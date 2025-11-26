@@ -606,57 +606,31 @@ class MedicalEnvironmentManager(EnvironmentManagerBase):
         super().__init__(envs, projection_f, config)
 
     def reset(self, kwargs):
-        text_obs, infos = self.envs.reset(kwargs=kwargs)
+        text_obs, image_obs, infos = self.envs.reset(kwargs=kwargs)
         self.memory.reset(batch_size=len(text_obs))
         self.pre_text_obs = text_obs
 
-        full_text_obs = self.build_text_obs(text_obs, infos, init=True)
-        return {'text': full_text_obs, 'image': None, 'anchor': text_obs}, infos
+        full_text_obs = self.build_text_obs(text_obs)
+        return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
 
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions)
-        text_obs, rewards, dones, infos = self.envs.step(actions)
+        text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
         self.pre_text_obs = text_obs
 
-        full_text_obs = self.build_text_obs(text_obs, infos)
+        full_text_obs = self.build_text_obs(text_obs)
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
 
-        next_observations = {'text': full_text_obs, 'image': None, 'anchor': text_obs}
+        next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
         return next_observations, rewards, dones, infos
 
-    def build_text_obs(self, text_obs: List[str], infos: List[Dict], init: bool = False) -> List[str]:
-        postprocess_text_obs = []
-        if not init and self.config.env.history_length > 0:
-            memory_contexts, valid_lens = self.memory.fetch(
-                    self.config.env.history_length,
-                    obs_key="text_obs",
-                    action_key="action")
-
-        for i in range(len(text_obs)):
-            available_tools = infos[i].get('available_tools', []) if i < len(infos) else []
-            tool_block = "\n".join(f"- {tool}" for tool in available_tools)
-
-            if init or self.config.env.history_length <= 0:
-                obs = MEDICAL_AGENT_TEMPLATE_NO_HIS.format(
-                        patient_overview=text_obs[i],
-                        available_tools=tool_block,
-                    )
-            else:
-                obs = MEDICAL_AGENT_TEMPLATE.format(
-                        patient_overview=text_obs[i],
-                        step_count=len(self.memory[i]),
-                        history_length=valid_lens[i],
-                        action_history=memory_contexts[i],
-                        current_step=len(self.memory[i]) + 1,
-                        available_tools=tool_block,
-                    )
-            postprocess_text_obs.append(obs)
-        return postprocess_text_obs
+    def build_text_obs(self, text_obs: List[str]) -> List[str]:
+        return list(text_obs)
 
 def make_envs(config):
     """
